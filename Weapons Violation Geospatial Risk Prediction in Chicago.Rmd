@@ -1,0 +1,722 @@
+---
+title: "Weapons Violation Geospatial Risk Prediction"
+author: "Yixuan Zhou"
+date: 2023-10-09
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r 1, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 Motivation
+
+In this report, a geospatial risk prediction model of weapons violation in Chicago is built on three different features to help the rational allocation of police force. Even though there is still some ambiguity in the model, most part of the model functions well and can successfully predict the potential crimes too.  
+
+# 2 Data Wrangling
+
+## 2.1 Set up
+
+The outcome I chose this time is Weapons Violation. In this part, I installed the packages and downloaded the data that will be used in this analysis. 
+
+```{r, warning = FALSE, message = FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(classInt)   # for KDE and ML risk class intervals
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+```{r, results = FALSE,warning = FALSE, message = FALSE}
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+  
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+weapons_violation <- # it is a source of crime data
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2017/d62x-nvdr") %>% 
+    filter(Primary.Type == "WEAPONS VIOLATION" ) %>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>%
+  dplyr::select(-Date, -Updated.On)%>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+```
+
+## 2.2 Weapons Violation
+
+### 2.2.1 Map of Weapons Violation in point form
+
+In the provided figure, we observe a concentration of weapons violation crimes in the Midwest and South Central regions of Chicago. These incidents then extend in a northward and southward direction from these focal points.
+
+Due to the heightened severity of weapons violations compared to other types of crimes, they are less likely to be subject to selective handling by the public security department. Consequently, holding other factors constant, the projected outcomes for weapons violations are more prone to apply uniformly across the geographical expanse. Nevertheless, a degree of bias persists. This is due to the potential concentration of law enforcement resources in high-crime areas, resulting in an increased prevalence of incidents in these regions and consequently, a spatial bias.  
+
+Here is the plot of Density of Weapons Violation below. We may observe two distinct crime hotspots characterized by high densities, juxtaposed with other areas exhibiting lower densities.
+
+
+```{r message=FALSE, fig.width=6, fig.height=4}
+# uses grid.arrange to organize independent plots
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = weapons_violation, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Weapons Violation, Chicago - 2017") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(weapons_violation)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Weapons Violation") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+```
+
+### 2.2.2 Map of Weapons Violation joined to the fishnet.
+
+In this part, I made a fishnet and aggregate points into the fishnet.
+
+```{r}
+## using {sf} to create the grid
+## Note the `.[chicagoBoundary] %>% ` line. This is needed to clip the grid to our data
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            # fast way to select intersecting polygons
+  st_sf() %>%
+  mutate(uniqueID = 1:n())
+
+
+```
+
+Based on the visual representation depicted in the figure below, it becomes evident that there are two distinct crime hotspots located in Chicago's Midwest and South Central areas. Additionally, the figure provides a clear depiction of the number of crimes within each grid. Notably, the hotspots in the central and western regions exhibit a higher degree of concentration. Conversely, the crime-dense area in the central and southern regions is more extensive, yet the density of incidents is comparatively lower when compared to the central and western regions.
+
+```{r}
+## add a value of 1 to each crime, sum them with aggregate
+crime_net <- 
+  dplyr::select(weapons_violation) %>% 
+  mutate(countWeapons = 1) %>%
+  aggregate(., fishnet, sum) %>%
+  mutate(countWeapons = replace_na(countWeapons, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countWeapons), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Count of Weapons Violation for the fishnet") +
+  mapTheme()
+
+# For demo. requires updated mapview package
+# xx <- mapview::mapview(crime_net, zcol = "countBurglaries")
+# yy <- mapview::mapview(mutate(burglaries, ID = seq(1:n())))
+# xx + yy
+```
+
+## 2.3 Risk factors
+
+### 2.3.1 Small multiple maps of risk factors in the fishnet 
+
+Here are the risk factors I chose：
+
+-   `abandonCars`: The number of abandoned cars can show the degree of desolation of a place which means fewer stares on the streets and lead to more crime.
+
+-   `rodentBaiting`： The number of 311 calls for complains about rodent baiting reveals the poor sanitation and discipline.
+
+-   `shotspotterAlerts`： The number of shotspotter alerts determines the location of potential outdoor gunfire and may have direct relationship with weapons violation.
+
+```{r, warning = FALSE, message = FALSE, include=FALSE}
+## only pulling a single variable for our model to keep it simple
+## using Socrata again
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Cars")
+
+## 311 Service Requests - Rodent Baiting
+rodentBaiting <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Rodent-Baiting-Historical/97t6-zrhs") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Rodent_Baiting")
+
+##Violence Reduction - Shotspotter Alerts
+shotspotterAlerts <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Violence-Reduction-Shotspotter-Alerts/3h7q-7mdb") %>%
+    mutate(year = substr(date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Shotspotter_Alerts")
+
+## Neighborhoods to use in LOOCV in a bit
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+
+```
+```{r message=FALSE}
+
+vars_net <- rbind(abandonCars,rodentBaiting,shotspotterAlerts) %>%
+  st_join(fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  left_join(fishnet, ., by = "uniqueID") %>%
+  spread(Legend, count, fill=0) %>%
+  dplyr::select(-`<NA>`) %>%
+  na.omit() %>%
+  ungroup()
+
+```
+
+
+```{r}
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Risk Factors by Fishnet"))
+
+```
+
+### 2.3.2 Small multiple maps of risk factors in the fishnet (nn)
+
+The nearest neighbor features are then plotted below. Abandoned cars and Rodent Baiting can be found almost throughout Chicago, with fewer of them in the south. Shotspotter alerts are mainly distributed in the south and north centers of Chicago, with fewer edges. 
+
+```{r}
+
+# convinience to reduce length of function names.
+st_c    <- st_coordinates
+st_coid <- st_centroid
+
+## create NN from abandoned cars
+vars_net <- vars_net %>%
+    mutate(Abandoned_Cars.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(abandonCars),
+                                           k = 3),
+           Rodent_Baiting.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(rodentBaiting),
+                                           k = 3),
+           Shotspotter_Alerts.nn = nn_function(st_c(st_coid(vars_net)), 
+                                           st_c(shotspotterAlerts),
+                                           k = 3))
+```
+
+```{r}
+
+## Visualize the NN feature
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+  gather(Variable, value, -geometry)
+
+vars1 <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars1){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Risk Factors by Fishnet"))
+
+```
+
+# 3  Exploring the spatial process of Weapons Violation
+
+```{r, warning = FALSE, message = FALSE, include=FALSE}
+## important to drop the geometry from joining features
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+```
+
+```{r}
+
+final_net <-
+  st_centroid(final_net) %>%
+    st_join(dplyr::select(neighborhoods, name), by = "uniqueID") %>%
+    st_join(dplyr::select(policeDistricts, District), by = "uniqueID") %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+      st_sf() %>%
+  na.omit()
+
+# for live demo
+# mapview::mapview(final_net, zcol = "District")
+
+```
+
+## 3.1 Local Moran’s I-related small multiple map
+
+This figure illustrates the local spatial processes of narcotics. A smaller p-value indicates a higher degree of spatial clustering. We observe a distinct spatial clustering trend in the southern region of Chicago and the Midwest. This suggests that the selected factors occur more frequently in these areas.
+
+```{r}
+## generates warnings from PROJ issues
+## {spdep} to make polygon to neighborhoods... 
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+## ... and neighborhoods to list of weigths
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+
+# print(final_net.weights, zero.policy=TRUE)
+```
+
+```{r}
+## see ?localmoran
+local_morans <- localmoran(final_net$countWeapons, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+# join local Moran's I results to fishnet
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(countWeapons,
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+
+```
+
+```{r}
+## This is just for plotting
+vars <- unique(final_net.localMorans$Variable)
+varList <- list()
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(final_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 4, top = "Local Morans I statistics, Weapons Violation"))
+```
+
+## 3.2 Plot NN distance to hot spot
+
+Then I use NN distance to a hot spot location. From the picture below, we can see that Chicago has two large purple blocks in the middle. This indicates that these areas are areas where Weapons violations occur or are closest to Weapons violations.
+
+```{r}
+# generates warning from NN
+
+final_net <- final_net %>% 
+  mutate(weapons.isSig = 
+           ifelse(local_morans[,5] <= 0.001, 1, 0)) %>%
+  mutate(weapons.isSig.dist = 
+           nn_function(st_c(st_coid(final_net)),
+                       st_c(st_coid(filter(final_net, 
+                                           weapons.isSig == 1))), 
+                       k = 1))
+
+## What does k = 1 represent?
+```
+
+```{r}
+ggplot() +
+      geom_sf(data = final_net, aes(fill=weapons.isSig.dist), colour=NA) +
+      scale_fill_viridis(name="Distance") +
+      labs(title="Distance to highly significant Weapons violations") +
+      mapTheme()
+```
+# 4 Correlation tests
+
+## 4.1 Small multiple scatterplot with correlations
+
+Here is the small multiple scatterplot with correlations. We then wanted to know the linear relationship between the different factors and the anesthetic. We can see that the three have a certain correlation with their nn features and show a positive trend.
+
+```{r message=FALSE}
+correlation.long <-
+  st_drop_geometry(final_net) %>%
+    dplyr::select(-uniqueID, -cvID, -name, -District) %>%
+    gather(Variable, Value, -countWeapons)
+
+correlation.cor <-
+  correlation.long %>%
+    group_by(Variable) %>%
+    summarize(correlation = cor(Value, countWeapons, use = "complete.obs"))
+    
+ggplot(correlation.long, aes(Value, countWeapons)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") +
+  labs(title = "Weapons Violations count as a function of risk factors") +
+  plotTheme()
+
+```
+
+## 4.2 A histogram of dependent variable
+
+Here is a histogram of dependent variable. Given the relatively infrequent occurrence of weapons violations, it is reasonable that most grid cells have no recorded criminal incidents. Therefore, we used Poisson regression. There are over 2000 frequencies between 0 and 20.
+
+```{r}
+
+ggplot() + 
+    geom_histogram(data = crime_net, aes(countWeapons),bins = 30, colour="black", fill = "#FDE725FF") +
+  scale_x_continuous(breaks = seq(0, 35, by = 1)) + 
+    labs(title="Distribution of Weapons Violations", subtitle = "LOGO-CV",
+         x="countWeapons", y="Count") 
+
+```
+
+
+
+# 5 Poisson Regression
+
+## 5.1 Small multiple map of model errors
+
+Here is a small multiple map illustrating model errors using random k-fold and spatial cross-validation. It is evident that the mean error is higher in areas with a greater number of weapons violations.
+
+```{r, warning = FALSE, message = FALSE, include=FALSE, sults='hide'}
+reg.vars <- c( "Abandoned_Cars.nn", "Rodent_Baiting.nn", "Shotspotter_Alerts.nn")
+
+reg.ss.vars <- c( "Abandoned_Cars.nn", "Rodent_Baiting.nn", "Shotspotter_Alerts.nn", 
+                  "weapons.isSig", "weapons.isSig.dist")
+
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countWeapons",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = cvID, countWeapons, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countWeapons",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = cvID, countWeapons, Prediction, geometry)
+  
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countWeapons",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, countWeapons, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countWeapons",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countWeapons, Prediction, geometry)
+
+```
+
+```{r message=FALSE}
+# calculate errors by NEIGHBORHOOD
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - countWeapons,
+                             Regression = "Random k-fold CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.cv,        Error = Prediction - countWeapons,
+                             Regression = "Random k-fold CV: Spatial Process"),
+    
+    mutate(reg.spatialCV,    Error = Prediction - countWeapons,
+                             Regression = "Spatial LOGO-CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.spatialCV, Error = Prediction - countWeapons,
+                             Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+    st_sf() 
+
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - countWeapons, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
+    facet_wrap(~Regression) +  
+    geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+    labs(title="Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+         x="Mean Absolute Error", y="Count") +
+    plotTheme()
+
+```
+## 5.2 Table of MAE and standard deviation MAE by regression
+
+In the table blow, the relationship found above can be seen numerically. After incorporating the spatial process, a notable reduction in Mean Absolute Error (MAE) is observed. This suggests the presence of a distinctive spatial pattern in the distribution of weapons violations.
+
+```{r}
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+    summarize(Mean_MAE = round(mean(MAE), 2),
+              SD_MAE = round(sd(MAE), 2)) %>%
+  kable() %>%
+    kable_styling("striped", full_width = F) %>%
+    row_spec(2, color = "black", background = "#FDE725FF") %>%
+    row_spec(4, color = "black", background = "#FDE725FF") 
+```
+
+## 5.3 Map of model errors by random k-fold and spatial cross validation
+
+Upon examining the map, it becomes evident that the Mean Absolute Error (MAE) exhibits higher values in the central-western region. This area coincides with the spatial cluster identified through our Local Moran's I-related test.
+
+```{r}
+vars2 <- unique(error_by_reg_and_fold$Regression)
+varList2 <- list()
+
+for(i in vars2){
+  varList2[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(error_by_reg_and_fold, Regression == i), 
+              aes(fill = MAE), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList2, ncol = 4, top = "Map of model errors by random k-fold and spatial cross validation"))
+  
+```
+
+## 5.4 Table of raw errors by race context
+
+Morans'I of Spatial LOGO-CV:Spatial Process is much smaller than that of just risk factors.
+
+```{r}
+
+neighborhood.weights <-
+  filter(error_by_reg_and_fold, Regression == "Spatial LOGO-CV: Spatial Process") %>%
+    group_by(cvID) %>%
+      poly2nb(as_Spatial(.), queen=TRUE) %>%
+      nb2listw(., style="W", zero.policy=TRUE)
+
+filter(error_by_reg_and_fold, str_detect(Regression, "LOGO"))  %>% 
+    st_drop_geometry() %>%
+    group_by(Regression) %>%
+    summarize(Morans_I = moran.mc(abs(Mean_Error), neighborhood.weights, 
+                                 nsim = 999, zero.policy = TRUE, 
+                                 na.action=na.omit)[[1]],
+              p_value = moran.mc(abs(Mean_Error), neighborhood.weights, 
+                                 nsim = 999, zero.policy = TRUE, 
+                                 na.action=na.omit)[[3]]) %>%
+    kable() %>%
+      kable_styling("striped", full_width = F) %>%
+      row_spec(2, color = "black", background = "#FDE725FF") 
+
+```
+
+# 6 Density vs predictions
+
+## 6.1  Map comparing kernel density to risk predictions for the next year’s crime.
+
+We can find that the highest core density is in the central and western parts of downtown Chicago, with the south being larger but less dense.
+
+```{r message=FALSE}
+# demo of kernel width
+weap_ppp <- as.ppp(st_coordinates(weapons_violation), W = st_bbox(final_net))
+weap_KD.1000 <- spatstat.explore::density.ppp(weap_ppp, 1000)
+weap_KD.1500 <- spatstat.explore::density.ppp(weap_ppp, 1500)
+weap_KD.2000 <- spatstat.explore::density.ppp(weap_ppp, 2000)
+weap_KD.df <- rbind(
+  mutate(data.frame(rasterToPoints(mask(raster(weap_KD.1000), as(neighborhoods, 'Spatial')))), Legend = "1000 Ft."),
+  mutate(data.frame(rasterToPoints(mask(raster(weap_KD.1500), as(neighborhoods, 'Spatial')))), Legend = "1500 Ft."),
+  mutate(data.frame(rasterToPoints(mask(raster(weap_KD.2000), as(neighborhoods, 'Spatial')))), Legend = "2000 Ft.")) 
+
+weap_KD.df$Legend <- factor(weap_KD.df$Legend, levels = c("1000 Ft.", "1500 Ft.", "2000 Ft."))
+
+ggplot(data=weap_KD.df, aes(x=x, y=y)) +
+  geom_raster(aes(fill=layer)) + 
+  facet_wrap(~Legend) +
+  coord_sf(crs=st_crs(final_net)) + 
+  scale_fill_viridis(name="Density") +
+  labs(title = "Kernel density with 3 different search radii") +
+  mapTheme(title_size = 14)
+
+```
+
+```{r}
+
+as.data.frame(weap_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+   ggplot() +
+     geom_sf(aes(fill=value)) +
+     geom_sf(data = sample_n(weapons_violation, 1500), size = .5) +
+     scale_fill_viridis(name = "Density") +
+     labs(title = "Kernel density of 2017 weapons violation") +
+     mapTheme(title_size = 14)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+
+weapon_violation18 <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2018/3i3m-jwuy") %>% 
+  filter(Primary.Type == "WEAPONS VIOLATION") %>%
+  mutate(x = gsub("[()]", "", Location)) %>%
+  separate(x,into= c("Y","X"), sep=",") %>%
+  mutate(X = as.numeric(X),
+         Y = as.numeric(Y)) 
+
+weapon_violation18 <- weapon_violation18 %>%
+  dplyr::select(-Date, -Updated.On)%>%  
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102271') %>% 
+  distinct() %>%
+  .[fishnet,]
+
+```
+
+```{r}
+
+weap_KDE_sum <- as.data.frame(weap_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) 
+kde_breaks <- classIntervals(weap_KDE_sum$value, 
+                             n = 5, "fisher")
+weap_KDE_sf <- weap_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = classInt::findCols(kde_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(weapon_violation18) %>% mutate(weapCount = 1), ., sum) %>%
+    mutate(weapCount = replace_na(weapCount, 0))) %>%
+  dplyr::select(label, Risk_Category, weapCount)
+```
+
+```{r, warning=FALSE, message=FALSE}
+ml_breaks <- classIntervals(reg.ss.spatialCV$Prediction, 
+                             n = 5, "fisher")
+weap_risk_sf <-
+  reg.ss.spatialCV %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category =classInt::findCols(ml_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(weapon_violation18) %>% mutate(weapCount = 1), ., sum) %>%
+      mutate(weapCount = replace_na(weapCount, 0))) %>%
+  dplyr::select(label,Risk_Category, weapCount)
+
+```
+The approximate distribution of weapons violations observed in 2018 is consistent with predictions, but there is still ambiguity around the boundaries of the specific range of occurrences. More features/feature engineering would help.
+
+```{r, warning=FALSE, message=FALSE}
+rbind(weap_KDE_sf, weap_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(weapon_violation18, 3000), size = .5, colour = "black") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2017 weapons violation risk predictions; 2018 weapons violation") +
+    mapTheme(title_size = 14)
+```
+
+## 6.2 Bar plot making this comparison
+
+As depicted in the plot, the code snippet below computes the 2018 weapons violation rate categorized by risk level and model type.
+
+A well-fitted model is expected to demonstrate that the risk predictions encompass a higher proportion of 2018 weapons violations in the highest risk category compared to the Kernel density. Nevertheless, in our visualization, for the 1st and 4th risk levels, the predictions fall below the kernel density, indicating potential shortcomings in the model's accuracy. Conversely, for the 2nd, 3rd, and 5th risk levels, the model exhibits commendable predictive performance.
+
+```{r, warning=FALSE, message=FALSE}
+rbind(weap_KDE_sf, weap_risk_sf) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countWeapons = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countWeapons / sum(countWeapons)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE, name = "Model") +
+      labs(title = "Risk prediction vs. Kernel density, 2018 weapons violation",
+           y = "% of Test Set Weapons Violation (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+# 7 Conclusion
+
+For this model I would recommend putting my algorithm into production.
+
+First, my model shows good fit and is able to predict more weapon violations than actually occur in most cases, i.e. it is able to predict potential crimes. Because weapons violations are serious and obvious, selective execution rarely occurs, so data collection is relatively effective.
+
+But I also want to expose some problems with the model. For example, it does not perform very well in the 4th risk category. This may require adding more feature engineering factors to fit a better model.
